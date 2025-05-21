@@ -12,6 +12,10 @@ import random
 from utils import *
 from apmeter import APMeter
 import os
+from torch.utils.tensorboard import SummaryWriter
+import logging
+
+from charades_dataloader import Charades as Dataset
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-mode', type=str, help='rgb or flow (or joint for eval)')
@@ -33,6 +37,7 @@ parser.add_argument('-num_layer', type=str, default='False')
 parser.add_argument('-unisize', type=str, default='False')
 parser.add_argument('-alpha_l', type=float, default='1.0')
 parser.add_argument('-beta_l', type=float, default='1.0')
+parser.add_argument('-output_dir', type=str, default='./output', help='Directory to save output files')
 args = parser.parse_args()
 
 # set random seed
@@ -47,27 +52,27 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 print('Random_SEED:', SEED)
 
-
 batch_size = int(args.batch_size)
 
+if str(args.unisize) == "True":
+    print("uni-size padd all T to",args.num_clips)
+    from charades_dataloader import collate_fn_unisize
+    collate_fn_f = collate_fn_unisize(args.num_clips)
+    collate_fn = collate_fn_f.charades_collate_fn_unisize
+else:
+    from charades_dataloader import mt_collate_fn as collate_fn
 
 if args.dataset == 'charades':
-    from charades_dataloader import Charades as Dataset
-
-    if str(args.unisize) == "True":
-        print("uni-size padd all T to",args.num_clips)
-        from charades_dataloader import collate_fn_unisize
-        collate_fn_f = collate_fn_unisize(args.num_clips)
-        collate_fn = collate_fn_f.charades_collate_fn_unisize
-    else:
-        from charades_dataloader import mt_collate_fn as collate_fn
-
     train_split = './data/charades.json'
     test_split = train_split
-    rgb_root =  '/rgb_feat_rgb' 
-    flow_root = '/flow_feat_path/' # optional
-    # rgb_of=[rgb_root,flow_root]
+    rgb_root =  args.rgb_root 
     classes = 157
+    
+elif args.dataset == 'tsu':
+    train_split = './data/smarthome_CS_51.json'
+    test_split = train_split
+    rgb_root =  args.rgb_root 
+    classes = 51
 
 
 def load_data(train_split, val_split, root):
@@ -97,22 +102,45 @@ def load_data(train_split, val_split, root):
 def run(models, criterion, num_epochs=50):
     since = time.time()
     Best_val_map = 0.
+    writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard_logs'))
+    
     for epoch in range(num_epochs):
         since1 = time.time()
-        print('Epoch {}/{}'.format(epoch, num_epochs - 1))
-        print('-' * 10)
+        logging.info(f'Epoch {epoch}/{num_epochs - 1}')
+        logging.info('-' * 10)
         for model, gpu, dataloader, optimizer, sched, model_file in models:
-            _, _ = train_step(model, gpu, optimizer, dataloader['train'], epoch)
+            train_map, train_loss = train_step(model, gpu, optimizer, dataloader['train'], epoch)
+            logging.info(f'Epoch {epoch} - Train MAP: {train_map:.2f}, Train Loss: {train_loss:.4f}')
             prob_val, val_loss, val_map = val_step(model, gpu, dataloader['val'], epoch)
+            logging.info(f'Epoch {epoch} - Val MAP: {val_map:.2f}, Val Loss: {val_loss:.4f}')
             sched.step(val_loss)
+            
+            # Log metrics to TensorBoard
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('mAP/train', train_map, epoch)
+            writer.add_scalar('mAP/val', val_map, epoch)
+            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+            
             # Time
-            print("epoch", epoch, "Total_Time",time.time()-since, "Epoch_time",time.time()-since1)
+            epoch_time = time.time() - since1
+            total_time = time.time() - since
+            logging.info(f"Epoch {epoch}, Total_Time {total_time:.2f}, Epoch_time {epoch_time:.2f}")
+            writer.add_scalar('Time/epoch', epoch_time, epoch)
+            writer.add_scalar('Time/total', total_time, epoch)
             
             if Best_val_map < val_map:
                 Best_val_map = val_map
-                print("epoch",epoch,"Best Val Map Update",Best_val_map)
-                pickle.dump(prob_val, open('./save_logit/' + str(epoch) + '.pkl', 'wb'), pickle.HIGHEST_PROTOCOL)
-                print("logit_saved at:","./save_logit/" + str(epoch) + ".pkl")
+                logging.info(f"Epoch {epoch}, Best Val Map Update {Best_val_map:.4f}")
+                pickle.dump(prob_val, open(os.path.join(args.output_dir, f'{epoch}.pkl'), 'wb'), pickle.HIGHEST_PROTOCOL)
+                logging.info(f"Logit saved at: {args.output_dir}/{epoch}.pkl")
+                
+                # Save best model
+                torch.save(model.state_dict(), os.path.join(args.output_dir, 'best_model.pth'))
+                logging.info(f"Best model saved at: {args.output_dir}/best_model.pth")
+                writer.add_scalar('Best_mAP/val', Best_val_map, epoch)
+    
+    writer.close()
 
 
 def eval_model(model, dataloader, baseline=False):
@@ -124,7 +152,6 @@ def eval_model(model, dataloader, baseline=False):
 
         results[other[0][0]] = (outputs.data.cpu().numpy()[0], probs.data.cpu().numpy()[0], data[2].numpy()[0], fps)
     return results
-
 
 def run_network(model, data, gpu, epoch=0, baseline=False):
     # 
@@ -153,7 +180,6 @@ def run_network(model, data, gpu, epoch=0, baseline=False):
 
     return outputs_final, loss, probs_f, corr / tot
 
-
 def train_step(model, gpu, optimizer, dataloader, epoch):
     model.train(True)
     tot_loss = 0.0
@@ -173,7 +199,7 @@ def train_step(model, gpu, optimizer, dataloader, epoch):
         optimizer.step()
 
     train_map = 100 * apm.value().mean()
-    print('epoch',epoch,'train-map:', train_map)
+    logging.info(f'Epoch {epoch}, train-map: {train_map:.4f}')
     apm.reset()
 
     epoch_loss = tot_loss / num_iter
@@ -213,13 +239,23 @@ def val_step(model, gpu, dataloader, epoch):
     val_map = torch.sum(100 * apm.value()) / torch.nonzero(100 * apm.value()).size()[0]
     sample_val_map = torch.sum(100 * sampled_apm.value()) / torch.nonzero(100 * sampled_apm.value()).size()[0]
 
-    print('epoch',epoch,'Full-val-map:', val_map)
-    print('epoch',epoch,'sampled-val-map:', sample_val_map)
-    print(100 * sampled_apm.value())
+    logging.info(f'Epoch {epoch}, Full-val-map: {val_map:.4f}')
+    logging.info(f'Epoch {epoch}, sampled-val-map: {sample_val_map:.4f}')
+    logging.info(f'Sampled AP values: {100 * sampled_apm.value()}')
     apm.reset()
     sampled_apm.reset()
     return full_probs, epoch_loss, val_map
 
+def setup_logging(output_dir):
+    log_file = os.path.join(output_dir, 'training.log')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler()
+        ]
+    )
 
 if __name__ == '__main__':
     if args.mode == 'flow':
@@ -229,8 +265,11 @@ if __name__ == '__main__':
         print('RGB mode', rgb_root)
         dataloaders, datasets = load_data(train_split, test_split, rgb_root)
 
-    if not os.path.exists('./save_logit'):
-        os.makedirs('./save_logit')
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    setup_logging(args.output_dir)
+    logging.info(f"Arguments: {args}")
 
     if args.train:
 
@@ -254,6 +293,7 @@ if __name__ == '__main__':
             final_embedding_dim = 512
             
             rgb_model = MSTCT(inter_channels, num_block, head, mlp_ratio, in_feat_dim, final_embedding_dim, num_classes)
+
             print("loaded",args.load_model)
 
         rgb_model.cuda()
@@ -262,4 +302,15 @@ if __name__ == '__main__':
         lr = float(args.lr)
         optimizer = optim.Adam(rgb_model.parameters(), lr=lr)
         lr_sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=8, verbose=True)
+
+        logging.info(f"Model: {args.model}")
+        logging.info(f"Number of clips: {num_clips}")
+        logging.info(f"Number of classes: {num_classes}")
+        logging.info(f"Inter channels: {inter_channels}")
+        logging.info(f"Number of blocks: {num_block}")
+        logging.info(f"Number of heads: {head}")
+        logging.info(f"MLP ratio: {mlp_ratio}")
+        logging.info(f"Input feature dimension: {in_feat_dim}")
+        logging.info(f"Final embedding dimension: {final_embedding_dim}")
+
         run([(rgb_model, 0, dataloaders, optimizer, lr_sched, args.comp_info)], criterion, num_epochs=int(args.epoch))
