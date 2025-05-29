@@ -6,7 +6,7 @@ python train.py \
 -mode rgb \
 -model MS_TCT \
 -train True \
--rgb_root /path/to/smarthome_features_i3d/ \
+-rgb_root /path/to/tsu_features_i3d/ \
 -num_clips 2500 \
 -skip 0 \
 -lr 0.0001 \
